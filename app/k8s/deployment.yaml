@@ -1,0 +1,71 @@
+# Account service on EKS (Module 11.4). Before applying, replace:
+#   ACCOUNT_ID                -> your 12-digit account id (or use the ecr_repository_url output)
+#   SG_ACCOUNT_SERVICE_ID     -> terraform output sg_account_service_id  (or the stack 1 output)
+#
+# Differences from the lab, deliberately:
+#   * The Service listens on 8080, not 80, so the security group rule (Lambda -> 8080) matches exactly.
+#   * The load balancer is tied to the account-service security group, so "the Lambda badge may
+#     reach the account-service badge" is true for the load balancer too, not just for pods.
+#   * loadBalancerSourceRanges limits it to the VPC as a second layer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: account-service
+  template:
+    metadata:
+      labels:
+        app: account-service
+    spec:
+      # replicas: 3 with a spread constraint is how a container service survives an Availability
+      # Zone failure. Three replicas on one node is not redundancy: it is three copies of the same
+      # single point of failure.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: account-service
+      containers:
+        - name: account-service
+          # Never deploy "latest". Tag with a version or a git commit hash.
+          image: ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/mb/account-service:v1
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account-service
+  annotations:
+    # A bank's account service must never be reachable from the internet. With this annotation
+    # EXTERNAL-IP in kubectl output is a PRIVATE address inside your VPC, whatever it is labelled.
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-security-groups: "SG_ACCOUNT_SERVICE_ID"
+spec:
+  type: LoadBalancer
+  selector:
+    app: account-service
+  loadBalancerSourceRanges:
+    - 10.20.0.0/16
+  ports:
+    - port: 8080
+      targetPort: 8080

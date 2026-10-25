@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Meridian Bank lab, stack 4 of 4 - containers (Module 11). An ECR repository for the
+  account-service image and, only if you ask for it, an EKS cluster with a managed node
+  group in the private subnets from stack 1. The EKS part BILLS BY THE HOUR.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mb
+    AllowedPattern: '^[a-z][a-z0-9]{1,5}$'
+  NetworkStackName:
+    Type: String
+    Default: mb-network
+  DataStackName:
+    Type: String
+    Default: mb-data
+  EnableEks:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      EKS control plane (0.10 USD/hour in standard support, 0.60 in extended) plus nodes plus a
+      load balancer. Stack 1 must have been deployed with EnableNat=true, or the nodes cannot
+      reach the cluster, ECR or the internet.
+  ClusterName:
+    Type: String
+    Default: meridian-lab
+  KubernetesVersion:
+    Type: String
+    Default: '1.35'
+    Description: CHECK the EKS release calendar. A version past standard support bills 6x more.
+  NodeInstanceType:
+    Type: String
+    Default: t3.small
+  NodeDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 5
+  ApiAccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Who may reach the Kubernetes API from the internet. Set this to your own IP /32. A bank would disable public access.
+
+Conditions:
+  UseEks: !Equals [!Ref EnableEks, 'true']
+
+Resources:
+  # ---------------------------------------------------------------------- ECR
+  AccountServiceRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${Prefix}/account-service'
+      # Never deploy "latest": a rollback is not exact. IMMUTABLE makes re-pushing a tag an error.
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true      # the stack can delete the repo even if it still holds images (lab setting)
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: {'Fn::ImportValue': !Sub '${DataStackName}-KeyArn'}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the last 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+
+  # ---------------------------------------------------------------------- EKS
+  # "If ECR is the cupboard, EKS is the kitchen." Your Lambda is a CONSUMER of this service.
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Condition: UseEks
+    Properties:
+      RoleName: !Sub '${Prefix}-eks-cluster-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonEKSClusterPolicy]
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Condition: UseEks
+    Properties:
+      RoleName: !Sub '${Prefix}-eks-node-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Condition: UseEks
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: !Split
+          - ','
+          - !Join
+            - ','
+            - - {'Fn::ImportValue': !Sub '${NetworkStackName}-PrivateSubnetIds'}
+              - {'Fn::ImportValue': !Sub '${NetworkStackName}-PublicSubnetIds'}
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+        PublicAccessCidrs: [!Ref ApiAccessCidr]
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      # THE COST GUARD. The default is EXTENDED: when this version's standard support ends AWS
+      # keeps the cluster running and bills 0.60 USD/hour instead of 0.10. STANDARD makes AWS
+      # upgrade the cluster instead of billing 6x.
+      UpgradePolicy: {SupportType: STANDARD}
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Condition: UseEks
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub '${Prefix}-nodes'
+      NodeRole: !GetAtt NodeRole.Arn
+      # privateNetworking: nodes get no public address. They pull images from ECR through the
+      # VPC endpoints and reach the internet for updates through the NAT.
+      Subnets: !Split [',', {'Fn::ImportValue': !Sub '${NetworkStackName}-PrivateSubnetIds'}]
+      AmiType: AL2023_x86_64_STANDARD
+      InstanceTypes: [!Ref NodeInstanceType]
+      CapacityType: ON_DEMAND
+      ScalingConfig:
+        DesiredSize: !Ref NodeDesiredCount
+        MinSize: 1
+        MaxSize: 6
+      UpdateConfig: {MaxUnavailable: 1}
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt AccountServiceRepository.RepositoryUri
+  ClusterName:
+    Condition: UseEks
+    Value: !Ref Cluster

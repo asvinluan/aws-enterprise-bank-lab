@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Meridian Bank lab, stack 2 of 4 - data and records (Modules 3 and 12). KMS key,
+  three DynamoDB tables, S3 buckets with lifecycle and TLS-only policies, optional
+  Kinesis streams and Firehose (Parquet) delivery, Glue table and Athena workgroup.
+  Independent of the network stack: deploy it before or after stack 1.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mb
+    AllowedPattern: '^[a-z][a-z0-9]{1,5}$'
+    Description: Lower-case prefix for buckets, Glue and Athena (mb-*).
+  NamePrefixUpper:
+    Type: String
+    Default: MB
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9]{1,5}$'
+    Description: Prefix for DynamoDB tables and Kinesis streams, as in the lab (MB-Customers, MB-CTR).
+  EnableKinesis:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Two Kinesis streams. BILLS PER SHARD-HOUR even when idle.
+  EnableFirehose:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Firehose CTR -> S3 as Parquet. Needs EnableKinesis=true.
+  EnableEvidenceBucket:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Object Lock bucket (GOVERNANCE mode, 1 day) as a design demo of the evidence copy.
+  RecordingRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Expiry for recordings. 2555 = 7 years (the legal number). 30 in a dev environment, where test audio has no compliance value.
+  ArchiveToGlacier:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Add the Glacier transitions. Only valid when GlacierTransitionDays is less than RecordingRetentionDays.
+  GlacierTransitionDays:
+    Type: Number
+    Default: 180
+    MinValue: 30
+    Description: Days before recordings move to Glacier (used only when ArchiveToGlacier=true).
+
+Conditions:
+  UseKinesis: !Equals [!Ref EnableKinesis, 'true']
+  UseFirehose: !And
+    - !Equals [!Ref EnableKinesis, 'true']
+    - !Equals [!Ref EnableFirehose, 'true']
+  UseEvidence: !Equals [!Ref EnableEvidenceBucket, 'true']
+  UseArchive: !Equals [!Ref ArchiveToGlacier, 'true']
+
+Resources:
+  # ---------------------------------------------------------------------- KMS
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${Prefix} lab: recordings and data lake'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRoot
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'}
+            Action: kms:*
+            Resource: '*'
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${Prefix}-recordings'
+      TargetKeyId: !Ref Key
+
+  # ----------------------------------------------------------------- DynamoDB
+  # On-demand: contact-centre traffic is spiky and on-demand costs nothing idle.
+  # The partition key is the thing you LOOK UP by, so every read is a GetItem.
+  CustomersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${NamePrefixUpper}-Customers'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: phoneNumber, AttributeType: S}]
+      KeySchema: [{AttributeName: phoneNumber, KeyType: HASH}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  HolidaysTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${NamePrefixUpper}-Holidays'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: holidayDate, AttributeType: S}]
+      KeySchema: [{AttributeName: holidayDate, KeyType: HASH}]
+
+  ContactsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${NamePrefixUpper}-Contacts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: contactId, AttributeType: S}]
+      KeySchema: [{AttributeName: contactId, KeyType: HASH}]
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  # --------------------------------------------------------------- S3 buckets
+  RecordingsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${Prefix}-recordings-${AWS::AccountId}'
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true   # cuts KMS request costs by roughly 99 percent
+            ServerSideEncryptionByDefault: {SSEAlgorithm: 'aws:kms', KMSMasterKeyID: !GetAtt Key.Arn}
+      LifecycleConfiguration:
+        # THE TRAP: by default S3 does not transition objects under 128 KB, and short
+        # call recordings are routinely smaller. The rule looks like it works and nothing
+        # archives. Set this explicitly.
+        TransitionDefaultMinimumObjectSize: varies_by_storage_class
+        Rules:
+          - Id: priority-audio
+            Status: Enabled
+            Prefix: recordings/priority/
+            # Priority audio -> Glacier INSTANT Retrieval: a dispute is exactly the
+            # recording someone demands at short notice.
+            Transitions: !If
+              - UseArchive
+              - [{TransitionInDays: !Ref GlacierTransitionDays, StorageClass: GLACIER_IR}]
+              - !Ref AWS::NoValue
+            ExpirationInDays: !Ref RecordingRetentionDays
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+          - Id: general-audio
+            Status: Enabled
+            Prefix: recordings/general/
+            # General audio -> Glacier FLEXIBLE Retrieval: pure archive, minutes to hours is fine.
+            Transitions: !If
+              - UseArchive
+              - [{TransitionInDays: !Ref GlacierTransitionDays, StorageClass: GLACIER}]
+              - !Ref AWS::NoValue
+            ExpirationInDays: !Ref RecordingRetentionDays
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+          - Id: clean-up-landing-prefix
+            Status: Enabled
+            Prefix: connect/
+            ExpirationInDays: 7
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+      # NOTE: the S3 -> MB-RecordingRouter trigger is attached by deploy.sh AFTER stack 3
+      # exists. S3 validates the destination Lambda when the notification is set, and a
+      # bucket in this stack cannot point at a function in a later stack.
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${Prefix}-datalake-${AWS::AccountId}'
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: {SSEAlgorithm: 'aws:kms', KMSMasterKeyID: !GetAtt Key.Arn}
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${Prefix}-athena-results-${AWS::AccountId}'
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire-query-results, Status: Enabled, ExpirationInDays: 7}
+
+  # Object Lock can ONLY be switched on when the bucket is created: an architecture
+  # decision, not an operations one. GOVERNANCE here so you can still clean up; in a
+  # bank this is COMPLIANCE mode in a SEPARATE ACCOUNT, because Compliance cannot be
+  # overridden by anyone.
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseEvidence
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${Prefix}-evidence-${AWS::AccountId}'
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule: {DefaultRetention: {Mode: GOVERNANCE, Days: 1}}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: {SSEAlgorithm: 'aws:kms', KMSMasterKeyID: !GetAtt Key.Arn}
+
+  # Deny any request that is not over TLS.
+  RecordingsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RecordingsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt RecordingsBucket.Arn, !Sub '${RecordingsBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt DataLakeBucket.Arn, !Sub '${DataLakeBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt ResultsBucket.Arn, !Sub '${ResultsBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  # ------------------------------------------------------------------ Kinesis
+  # Connect writes one Contact Trace Record per contact when it ends, plus agent
+  # state changes. Kinesis is SERVER-SIDE and AUTHORITATIVE; the Connect Streams API
+  # is JavaScript in one agent's browser and only reports what that tab saw.
+  CtrStream:
+    Type: AWS::Kinesis::Stream
+    Condition: UseKinesis
+    Properties:
+      Name: !Sub '${NamePrefixUpper}-CTR'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+  AgentEventsStream:
+    Type: AWS::Kinesis::Stream
+    Condition: UseKinesis
+    Properties:
+      Name: !Sub '${NamePrefixUpper}-AgentEvents'
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+  # ------------------------------------------------------------- Glue + Athena
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${Prefix}_analytics'
+
+  CtrTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: ctr
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          EXTERNAL: 'TRUE'
+          # Partition projection: Athena works out the partition folders from the template
+          # instead of needing MSCK REPAIR TABLE after every delivery.
+          projection.enabled: 'true'
+          projection.year.type: integer
+          projection.year.range: 2024,2035
+          projection.month.type: integer
+          projection.month.range: 1,12
+          projection.month.digits: '2'
+          projection.day.type: integer
+          projection.day.range: 1,31
+          projection.day.digits: '2'
+          storage.location.template: !Sub 's3://${DataLakeBucket}/ctr/year=${!year}/month=${!month}/day=${!day}/'
+        PartitionKeys:
+          - {Name: year, Type: string}
+          - {Name: month, Type: string}
+          - {Name: day, Type: string}
+        StorageDescriptor:
+          Location: !Sub 's3://${DataLakeBucket}/ctr/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          # A deliberately small slice of the Contact Trace Record schema. customerTier and
+          # lineOfBusiness are contact ATTRIBUTES, so they land in the map automatically:
+          # per-tier reporting needs no extra instrumentation.
+          Columns:
+            - {Name: contactid, Type: string}
+            - {Name: channel, Type: string}
+            - {Name: initiationmethod, Type: string}
+            - {Name: initiationtimestamp, Type: string}
+            - {Name: disconnecttimestamp, Type: string}
+            - {Name: queue, Type: 'struct<name:string,arn:string,enqueuetimestamp:string>'}
+            - {Name: agent, Type: 'struct<username:string,arn:string,connectedtoagenttimestamp:string>'}
+            - {Name: attributes, Type: 'map<string,string>'}
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${Prefix}-workgroup'
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        # A cost guard: Athena bills per byte scanned. A runaway query stops at 1 GB.
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${ResultsBucket}/athena/'
+          EncryptionConfiguration: {EncryptionOption: SSE_S3}
+
+  CallsByTierQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: calls-by-customer-tier
+      Description: Per-tier volume with no extra instrumentation; customerTier is a contact attribute.
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT attributes['customerTier'] AS tier, COUNT(*) AS contacts
+        FROM ctr
+        WHERE year = '2026' AND month = '10'
+        GROUP BY 1 ORDER BY 2 DESC
+
+  ContactsByQueueQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: contacts-by-queue
+      Description: Volume per queue, for service-level reporting.
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT queue.name AS queue_name, COUNT(*) AS contacts
+        FROM ctr
+        WHERE year = '2026' AND month = '10'
+        GROUP BY 1 ORDER BY 2 DESC
+
+  # ----------------------------------------------------------------- Firehose
+  # Firehose if you only need delivery to S3 with buffering and format conversion (simpler,
+  # cheaper). Data Streams if you need several independent consumers or real-time processing.
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UseFirehose
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${Prefix}-ctr-to-s3'
+      RetentionInDays: 7
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Condition: UseFirehose
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: DestinationDelivery
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Condition: UseFirehose
+    Properties:
+      RoleName: !Sub '${Prefix}-FirehoseRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: firehose.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deliver-ctr-to-lake
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadStream
+                Effect: Allow
+                Action: [kinesis:DescribeStream, kinesis:GetShardIterator, kinesis:GetRecords, kinesis:ListShards]
+                Resource: !GetAtt CtrStream.Arn
+              - Sid: WriteLake
+                Effect: Allow
+                Action: [s3:AbortMultipartUpload, s3:GetBucketLocation, s3:GetObject, s3:ListBucket, s3:ListBucketMultipartUploads, s3:PutObject]
+                Resource: [!GetAtt DataLakeBucket.Arn, !Sub '${DataLakeBucket.Arn}/*']
+              - Sid: ReadSchema
+                Effect: Allow
+                Action: [glue:GetTable, glue:GetTableVersion, glue:GetTableVersions]
+                Resource: '*'
+              - Sid: UseKey
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt Key.Arn
+              - Sid: WriteDeliveryLogs
+                Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !Sub '${FirehoseLogGroup.Arn}:*'
+
+  CtrDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Condition: UseFirehose
+    Properties:
+      DeliveryStreamName: !Sub '${Prefix}-ctr-to-s3'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt CtrStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        Prefix: 'ctr/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        # 64 MB is the minimum buffer when format conversion is on.
+        BufferingHints: {SizeInMBs: 64, IntervalInSeconds: 300}
+        # Parquet does its own (Snappy) compression, so Firehose must not add more.
+        CompressionFormat: UNCOMPRESSED
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration: {Deserializer: {OpenXJsonSerDe: {}}}
+          OutputFormatConfiguration: {Serializer: {ParquetSerDe: {}}}
+          SchemaConfiguration:
+            DatabaseName: !Ref GlueDatabase
+            TableName: !Ref CtrTable
+            RoleARN: !GetAtt FirehoseRole.Arn
+            CatalogId: !Ref AWS::AccountId
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+
+Outputs:
+  KeyArn:
+    Value: !GetAtt Key.Arn
+    Export: {Name: !Sub '${AWS::StackName}-KeyArn'}
+  RecordingsBucketName:
+    Value: !Ref RecordingsBucket
+    Export: {Name: !Sub '${AWS::StackName}-RecordingsBucket'}
+  RecordingsBucketArn:
+    Value: !GetAtt RecordingsBucket.Arn
+    Export: {Name: !Sub '${AWS::StackName}-RecordingsBucketArn'}
+  CustomersTable:
+    Value: !Ref CustomersTable
+    Export: {Name: !Sub '${AWS::StackName}-CustomersTable'}
+  HolidaysTable:
+    Value: !Ref HolidaysTable
+    Export: {Name: !Sub '${AWS::StackName}-HolidaysTable'}
+  ContactsTable:
+    Value: !Ref ContactsTable
+    Export: {Name: !Sub '${AWS::StackName}-ContactsTable'}
+  CtrStreamArn:
+    Condition: UseKinesis
+    Value: !GetAtt CtrStream.Arn
+    Export: {Name: !Sub '${AWS::StackName}-CtrStreamArn'}
+  AgentEventsStreamArn:
+    Condition: UseKinesis
+    Value: !GetAtt AgentEventsStream.Arn
+    Export: {Name: !Sub '${AWS::StackName}-AgentEventsStreamArn'}
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup

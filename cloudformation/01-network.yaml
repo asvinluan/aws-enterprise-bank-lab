@@ -1,0 +1,539 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Meridian Bank lab, stack 1 of 4 - the network (Module 10). One VPC, three tiers
+  (public, private, isolated) across three Availability Zones, route tables,
+  security groups that reference each other, free gateway endpoints, optional
+  NAT gateway, optional interface endpoints, flow logs. Deploy first, delete last.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mb
+    AllowedPattern: '^[a-z][a-z0-9]{1,5}$'
+    Description: Lower-case prefix. Resources become mb-*, as in the lab.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    Description: Must be a /16 so the subnet maths matches the lab's CIDR plan.
+  EnableNat:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: NAT gateway + Elastic IP. BILLS BY THE HOUR (about 0.059 USD/hour plus data in Sydney).
+  EnableInterfaceEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Eight interface endpoints x three AZs. BILLS BY THE HOUR per endpoint per AZ.
+  S3PrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    Description: >-
+      Managed prefix list of the S3 gateway endpoint (a gateway endpoint is reached through a list of the
+      service's addresses, not through the VPC CIDR). deploy.sh looks it up for you. By hand:
+      aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.ap-southeast-2.s3
+  DynamoDbPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    Description: Same, for com.amazonaws.<region>.dynamodb.
+  EnableFlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  FlowLogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  UseNat: !Equals [!Ref EnableNat, 'true']
+  UseInterfaceEndpoints: !Equals [!Ref EnableInterfaceEndpoints, 'true']
+  UseFlowLogs: !Equals [!Ref EnableFlowLogs, 'true']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true     # both are required for interface endpoints to resolve privately
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-vpc'}
+
+  # ------------------------------------------------------------------ subnets
+  # Public   10.20.0.0/24  .1.0/24  .2.0/24      NAT gateway only
+  # Private  10.20.10.0/23 .12.0/23 .14.0/23     Lambda ENIs, EKS nodes
+  # Isolated 10.20.30.0/24 .31.0/24 .32.0/24     databases, no route out at all
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 256, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-public-a"}
+        - {Key: Tier, Value: public}
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 256, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-public-b"}
+        - {Key: Tier, Value: public}
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 256, 8]]
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-public-c"}
+        - {Key: Tier, Value: public}
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 128, 9]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-private-a"}
+        - {Key: Tier, Value: private}
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [6, !Cidr [!Ref VpcCidr, 128, 9]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-private-b"}
+        - {Key: Tier, Value: private}
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [7, !Cidr [!Ref VpcCidr, 128, 9]]
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-private-c"}
+        - {Key: Tier, Value: private}
+
+  IsolatedSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [30, !Cidr [!Ref VpcCidr, 256, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-isolated-a"}
+        - {Key: Tier, Value: isolated}
+
+  IsolatedSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [31, !Cidr [!Ref VpcCidr, 256, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-isolated-b"}
+        - {Key: Tier, Value: isolated}
+
+  IsolatedSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [32, !Cidr [!Ref VpcCidr, 256, 8]]
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-isolated-c"}
+        - {Key: Tier, Value: isolated}
+
+  # ------------------------------------------------- gateways and route tables
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-igw'}
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UseNat
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-nat-eip'}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNat
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA     # a NAT lives in a PUBLIC subnet
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-nat'}
+
+  RtPublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-rt-public'}
+
+  RoutePublicInternet:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RtPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # PRIVATE: the default route goes to the NAT, NOT the internet gateway.
+  # Traffic can go OUT. Nothing can come IN. That is what "private" means.
+  RtPrivate:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-rt-private'}
+
+  RoutePrivateNat:
+    Type: AWS::EC2::Route
+    Condition: UseNat
+    Properties:
+      RouteTableId: !Ref RtPrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ISOLATED: no default route at all. A compromised database cannot phone home.
+  RtIsolated:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-rt-isolated'}
+
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref RtPublic
+
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref RtPublic
+
+  PublicAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref RtPublic
+
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref RtPrivate
+
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref RtPrivate
+
+  PrivateAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref RtPrivate
+
+  IsolatedAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnetA
+      RouteTableId: !Ref RtIsolated
+
+  IsolatedAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnetB
+      RouteTableId: !Ref RtIsolated
+
+  IsolatedAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnetC
+      RouteTableId: !Ref RtIsolated
+
+  # ---------------------------------------------------------- security groups
+  SgLambda:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Prefix}-sg-lambda'
+      GroupDescription: Lambda functions reaching internal services
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        # Explicit, least-privilege egress. Specifying ANY inline egress replaces the
+        # default allow-all rule, which is exactly what we want.
+        - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, DestinationSecurityGroupId: !Ref SgAccountService, Description: To the account service}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr, Description: HTTPS to interface endpoints inside the VPC}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: S3 via the gateway endpoint}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: DynamoDB via the gateway endpoint}
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-sg-lambda'}
+
+  SgAccountService:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Prefix}-sg-account-service'
+      GroupDescription: Account service - reachable only from the Lambda
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-sg-account-service'}
+
+  SgEndpoints:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Prefix}-sg-endpoints'
+      GroupDescription: VPC interface endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr, Description: HTTPS from inside the VPC}
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-sg-endpoints'}
+
+  # THE IMPORTANT PART: the source is another SECURITY GROUP, not a CIDR.
+  # "Anything wearing the Lambda badge may reach port 8080 on anything wearing the
+  # account-service badge." The rule follows the workload wherever it runs.
+  ServiceFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgAccountService
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref SgLambda
+      Description: Account service from Lambda
+
+  # --------------------------------------------------------- gateway endpoints
+  # Free: a route-table entry, not a network interface. S3 and DynamoDB only.
+  EndpointS3:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RtPrivate, !Ref RtIsolated]
+      # Endpoint policy = data-exfiltration control. Names only this lab's buckets
+      # (mb-<anything>-<account id>) plus the AWS-owned bucket that ECR serves image
+      # layers from. Without the second one image pulls break silently.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OnlyOurBuckets
+            Effect: Allow
+            Principal: '*'
+            Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetObjectTagging, s3:PutObjectTagging, s3:DeleteObject]
+            Resource:
+              - !Sub 'arn:aws:s3:::${Prefix}-*-${AWS::AccountId}'
+              - !Sub 'arn:aws:s3:::${Prefix}-*-${AWS::AccountId}/*'
+              - !Sub 'arn:aws:s3:::prod-${AWS::Region}-starport-layer-bucket/*'
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-vpce-s3'}
+
+  EndpointDynamoDb:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RtPrivate, !Ref RtIsolated]
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-vpce-dynamodb'}
+
+  # ------------------------------------------------------- interface endpoints
+  # Billed per hour per AZ plus per GB. PrivateDnsEnabled makes
+  # kms.ap-southeast-2.amazonaws.com resolve to a private address, so application
+  # code does not change at all.
+
+  EndpointKms:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kms
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-kms"}
+
+  EndpointSecretsmanager:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-secretsmanager"}
+
+  EndpointKinesisStreams:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kinesis-streams
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-kinesis-streams"}
+
+  EndpointBedrockRuntime:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-runtime
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-bedrock-runtime"}
+
+  EndpointEcrApi:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-ecr-api"}
+
+  EndpointEcrDkr:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-ecr-dkr"}
+
+  EndpointLogs:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-logs"}
+
+  EndpointSts:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sts
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref SgEndpoints]
+      PrivateDnsEnabled: true
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vpce-sts"}
+
+  # ---------------------------------------------------------------- flow logs
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UseFlowLogs
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/${Prefix}-flowlogs'
+      RetentionInDays: !Ref FlowLogRetentionDays
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: UseFlowLogs
+    Properties:
+      RoleName: !Sub '${Prefix}-flowlogs-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: vpc-flow-logs.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub '${FlowLogGroup.Arn}:*'
+
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: UseFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 600
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: {Name: !Sub '${AWS::StackName}-VpcId'}
+  PrivateSubnetIds:
+    Description: Three subnets in three AZs. Verify with describe-subnets that the AZ IDs differ.
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]]
+    Export: {Name: !Sub '${AWS::StackName}-PrivateSubnetIds'}
+  PublicSubnetIds:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB, !Ref PublicSubnetC]]
+    Export: {Name: !Sub '${AWS::StackName}-PublicSubnetIds'}
+  SgLambdaId:
+    Value: !Ref SgLambda
+    Export: {Name: !Sub '${AWS::StackName}-SgLambdaId'}
+  SgAccountServiceId:
+    Description: Goes in k8s/deployment.yaml (aws-load-balancer-security-groups).
+    Value: !Ref SgAccountService
+    Export: {Name: !Sub '${AWS::StackName}-SgAccountServiceId'}
+  NatGatewayId:
+    Condition: UseNat
+    Value: !Ref NatGateway

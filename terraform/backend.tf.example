@@ -1,0 +1,14 @@
+# Copy to backend.tf, create the bucket first (it is the one thing Terraform
+# cannot create for itself), then: terraform init -migrate-state
+#
+# State holds resource identifiers and sometimes secrets, so it is encrypted,
+# versioned, and locked. Plaintext state in S3 is a finding in a bank audit.
+terraform {
+  backend "s3" {
+    bucket       = "YOUR-STATE-BUCKET-NAME"
+    key          = "meridian-bank-lab/terraform.tfstate"
+    region       = "ap-southeast-2"
+    encrypt      = true
+    use_lockfile = true # S3-native locking (Terraform >= 1.10). Older: dynamodb_table = "tflock"
+  }
+}

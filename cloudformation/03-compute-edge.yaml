@@ -1,0 +1,859 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Meridian Bank lab, stack 3 of 4 - compute and edge (Modules 4, 9, 13, 14). The shared
+  Lambda role, five Lambda functions, API Gateway chat endpoint, optional WAF web ACL,
+  optional CloudWatch alarms, and optional wiring to an existing Amazon Connect instance.
+  Needs stack 2 (data) first and, when the Lambda runs in the VPC, stack 1 (network).
+  Deploy with deploy.sh: it runs `aws cloudformation package` to upload the Lambda code.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: mb
+    AllowedPattern: '^[a-z][a-z0-9]{1,5}$'
+  NamePrefixUpper:
+    Type: String
+    Default: MB
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9]{1,5}$'
+  NetworkStackName:
+    Type: String
+    Default: mb-network
+  DataStackName:
+    Type: String
+    Default: mb-data
+  ConnectInstanceId:
+    Type: String
+    Default: ''
+    Description: UUID of your Amazon Connect instance. Leave empty to skip everything that needs Connect.
+  ConnectContactFlowId:
+    Type: String
+    Default: REPLACE-WITH-FLOW-ID
+    Description: The MB-Main contact flow id the chat Lambda starts.
+  WireConnect:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Associate the Lambdas and the recordings bucket with the Connect instance.
+  WireKinesis:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Also point Connect's CTR and agent-event streams at stack 2's Kinesis streams (needs EnableKinesis=true there).
+  AccountApiUrl:
+    Type: String
+    Default: ''
+    Description: Base URL of the account service, with http:// and port. Empty skips the balance lookup.
+  CallerLookupInVpc:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  EnableWaf:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: WAF web ACL on the chat API (monthly fee per ACL and per rule).
+  RateLimitPer5Min:
+    Type: Number
+    Default: 100
+    MinValue: 10
+  ApiStageName:
+    Type: String
+    Default: prod
+  EnableAlarms:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: About 0.10 USD per alarm per month.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: An alarm to a topic nobody reads is decoration. Put a real address here.
+
+Conditions:
+  HasConnect: !Not [!Equals [!Ref ConnectInstanceId, '']]
+  InVpc: !Equals [!Ref CallerLookupInVpc, 'true']
+  WafOn: !Equals [!Ref EnableWaf, 'true']
+  AlarmsOn: !Equals [!Ref EnableAlarms, 'true']
+  AlarmsAndEmail: !And
+    - !Equals [!Ref EnableAlarms, 'true']
+    - !Not [!Equals [!Ref AlarmEmail, '']]
+  AlarmsAndConnect: !And
+    - !Equals [!Ref EnableAlarms, 'true']
+    - !Not [!Equals [!Ref ConnectInstanceId, '']]
+  WireConnectOn: !And
+    - !Equals [!Ref WireConnect, 'true']
+    - !Not [!Equals [!Ref ConnectInstanceId, '']]
+  WireKinesisOn: !And
+    - !Equals [!Ref WireConnect, 'true']
+    - !Equals [!Ref WireKinesis, 'true']
+    - !Not [!Equals [!Ref ConnectInstanceId, '']]
+
+Resources:
+  # ------------------------------------------------------ the one Lambda role
+  # What is deliberately ABSENT: no dynamodb:Scan (a scan reads every row; needing one means
+  # the data model is wrong), no DeleteItem (nothing here deletes), no wildcard on tables or buckets.
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefixUpper}-LambdaRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # Without this a VPC-attached Lambda cannot create the network interfaces it needs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: !Sub '${NamePrefixUpper}-LambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadReferenceData
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${NamePrefixUpper}-Customers'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${NamePrefixUpper}-Holidays'
+              - Sid: WriteContactRecords
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${NamePrefixUpper}-Contacts'
+              - Sid: StartContacts
+                Effect: Allow
+                Action: [connect:StartChatContact, connect:StartTaskContact]
+                Resource: !If
+                  - HasConnect
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - Sid: RouteRecordings
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetObjectTagging, s3:PutObjectTagging, s3:DeleteObject]
+                Resource: !Sub 'arn:aws:s3:::${Prefix}-recordings-${AWS::AccountId}/*'
+              - Sid: UseRecordingKey
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: {'Fn::ImportValue': !Sub '${DataStackName}-KeyArn'}
+              - Sid: SendSms
+                Effect: Allow
+                Action: sms-voice:SendTextMessage
+                Resource: '*'   # End User Messaging does not support resource-level scoping for this action
+
+  # ---------------------------------------------------------- the five Lambdas
+
+  CallerLookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefixUpper}-CallerLookup'
+      RetentionInDays: 14
+
+  CallerLookupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CallerLookupLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # Code is a local folder here; `aws cloudformation package` uploads it
+    Properties:
+      FunctionName: !Sub '${NamePrefixUpper}-CallerLookup'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      # Connect gives a Lambda 8 seconds. A higher timeout is pointless: Connect has already taken the Error branch.
+      Timeout: 8
+      MemorySize: 256
+      Code: ../app/lambdas/caller_lookup
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Sub '${NamePrefixUpper}-Customers'
+          CONTACTS_TABLE: !Sub '${NamePrefixUpper}-Contacts'
+          ACCOUNT_API: !Ref AccountApiUrl
+      # Three private subnets in three AZs is the point: a VPC Lambda is only as resilient as
+      # the subnets you give it. One subnet is one AZ.
+      VpcConfig: !If
+        - InVpc
+        - SecurityGroupIds: [{'Fn::ImportValue': !Sub '${NetworkStackName}-SgLambdaId'}]
+          SubnetIds: !Split [',', {'Fn::ImportValue': !Sub '${NetworkStackName}-PrivateSubnetIds'}]
+        - !Ref AWS::NoValue
+
+  HolidayCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefixUpper}-HolidayCheck'
+      RetentionInDays: 14
+
+  HolidayCheckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: HolidayCheckLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # Code is a local folder here; `aws cloudformation package` uploads it
+    Properties:
+      FunctionName: !Sub '${NamePrefixUpper}-HolidayCheck'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 8
+      MemorySize: 256
+      Code: ../app/lambdas/holiday_check
+      Environment:
+        Variables:
+          HOLIDAYS_TABLE: !Sub '${NamePrefixUpper}-Holidays'
+          UTC_OFFSET_HOURS: '10'
+
+  StartChatLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefixUpper}-StartChat'
+      RetentionInDays: 14
+
+  StartChatFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: StartChatLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # Code is a local folder here; `aws cloudformation package` uploads it
+    Properties:
+      FunctionName: !Sub '${NamePrefixUpper}-StartChat'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      # Not in the VPC: it must reach Connect's public API. A VPC Lambda would need a Connect endpoint or a NAT.
+      Timeout: 10
+      MemorySize: 256
+      Code: ../app/lambdas/start_chat
+      Environment:
+        Variables:
+          INSTANCE_ID: !If [HasConnect, !Ref ConnectInstanceId, REPLACE-WITH-INSTANCE-ID]
+          CONTACT_FLOW_ID: !Ref ConnectContactFlowId
+
+  RecordingRouterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefixUpper}-RecordingRouter'
+      RetentionInDays: 14
+
+  RecordingRouterFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RecordingRouterLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # Code is a local folder here; `aws cloudformation package` uploads it
+    Properties:
+      FunctionName: !Sub '${NamePrefixUpper}-RecordingRouter'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code: ../app/lambdas/recording_router
+      Environment:
+        Variables:
+          CONTACTS_TABLE: !Sub '${NamePrefixUpper}-Contacts'
+          BUCKET: !Sub '${Prefix}-recordings-${AWS::AccountId}'
+
+  SendSmsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NamePrefixUpper}-SendSms'
+      RetentionInDays: 14
+
+  SendSmsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SendSmsLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]   # Code is a local folder here; `aws cloudformation package` uploads it
+    Properties:
+      FunctionName: !Sub '${NamePrefixUpper}-SendSms'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 8
+      MemorySize: 256
+      Code: ../app/lambdas/send_sms
+      Environment:
+        Variables:
+          ORIGINATION_NUMBER: ''
+          CONFIG_SET: !Sub '${Prefix}-sms'
+
+  # S3 -> RecordingRouter. The permission lives here; deploy.sh then attaches the bucket
+  # notification (prefix connect/ is NOT optional: without it the function fires on the
+  # objects it writes itself and recurses forever).
+  RouterS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RecordingRouterFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${Prefix}-recordings-${AWS::AccountId}'
+
+  # ------------------------------------------------------------- API Gateway
+  # Browser -> API Gateway -> StartChat (holds the credentials) -> Connect. The browser never
+  # holds AWS keys.
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${NamePrefixUpper}-Web-API'
+      EndpointConfiguration: {Types: [REGIONAL]}
+
+  ChatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: chat
+
+  # POST starts a chat. OPTIONS is the browser's CORS preflight; the Lambda answers both.
+  ChatPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref ChatResource
+      HttpMethod: POST
+      AuthorizationType: NONE   # public by design: a customer has not logged in yet. That is why WAF sits in front.
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StartChatFunction.Arn}/invocations'
+
+  ChatOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref ChatResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StartChatFunction.Arn}/invocations'
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StartChatFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*/chat'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ChatPost, ChatOptions]
+    Properties:
+      RestApiId: !Ref Api
+      # CloudFormation does NOT redeploy an API when its methods change. If you edit them,
+      # bump this text (or redeploy from the console) - the API Gateway version of
+      # "I changed the flow and forgot to publish".
+      Description: v1
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      # A second layer behind WAF: even without WAF the stage cannot be driven faster than this.
+      MethodSettings:
+        - {ResourcePath: '/*', HttpMethod: '*', MetricsEnabled: true, ThrottlingBurstLimit: 50, ThrottlingRateLimit: 25}
+
+  # --------------------------------------------------------------------- WAF
+  # WAF governs contact INITIATION, not contact CONTENT. Once the browser holds a participant
+  # token it talks to Connect's own service, which you cannot attach a web ACL to. A blocked
+  # request never reaches API Gateway, never invokes the Lambda, never creates a billable contact.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: WafOn
+    Properties:
+      Name: !Sub '${NamePrefixUpper}-Web-ACL'
+      Description: Protects the public chat-start endpoint
+      Scope: REGIONAL
+      DefaultAction: {Allow: {}}
+      VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: !Sub '${NamePrefixUpper}-Web-ACL', SampledRequestsEnabled: true}
+      Rules:
+        # One person can start a few chats a minute, not a few thousand. An attacker rotating
+        # IPs stays under the threshold: this stops the lazy and the accidental attack.
+        - Name: RateLimitPerIP
+          Priority: 1
+          Action: {Block: {}}
+          Statement:
+            RateBasedStatement: {Limit: !Ref RateLimitPer5Min, AggregateKeyType: IP, EvaluationWindowSec: 300}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: RateLimitPerIP, SampledRequestsEnabled: true}
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesCommonRuleSet}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: CommonRuleSet, SampledRequestsEnabled: true}
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: KnownBadInputs, SampledRequestsEnabled: true}
+        # COUNT, do not block: customers travel and use VPNs. Tighten once you have data.
+        - Name: NonAustralianTraffic
+          Priority: 4
+          Action: {Count: {}}
+          Statement:
+            NotStatement:
+              Statement:
+                GeoMatchStatement: {CountryCodes: [AU]}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: NonAustralianTraffic, SampledRequestsEnabled: true}
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: WafOn
+    DependsOn: ApiStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${Api}/stages/${ApiStageName}'
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # ------------------------------------------------------------ Connect wiring
+  # Without the association the functions do not appear in the flow designer's dropdown.
+  CallerLookupAssociation:
+    Type: AWS::Connect::IntegrationAssociation
+    Condition: WireConnectOn
+    Properties:
+      InstanceId: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !GetAtt CallerLookupFunction.Arn
+
+  HolidayCheckAssociation:
+    Type: AWS::Connect::IntegrationAssociation
+    Condition: WireConnectOn
+    Properties:
+      InstanceId: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !GetAtt HolidayCheckFunction.Arn
+
+  SendSmsAssociation:
+    Type: AWS::Connect::IntegrationAssociation
+    Condition: WireConnectOn
+    Properties:
+      InstanceId: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !GetAtt SendSmsFunction.Arn
+
+  # All recordings go to ONE S3 location. You cannot branch the destination inside a flow,
+  # so RecordingRouter separates them by tier afterwards.
+  RecordingsStorage:
+    Type: AWS::Connect::InstanceStorageConfig
+    Condition: WireConnectOn
+    Properties:
+      InstanceArn: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      ResourceType: CALL_RECORDINGS
+      StorageType: S3
+      S3Config:
+        BucketName: !Sub '${Prefix}-recordings-${AWS::AccountId}'
+        BucketPrefix: connect
+        EncryptionConfig:
+          EncryptionType: KMS
+          KeyId: {'Fn::ImportValue': !Sub '${DataStackName}-KeyArn'}
+
+  CtrStorage:
+    Type: AWS::Connect::InstanceStorageConfig
+    Condition: WireKinesisOn
+    Properties:
+      InstanceArn: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      ResourceType: CONTACT_TRACE_RECORDS
+      StorageType: KINESIS_STREAM
+      KinesisStreamConfig:
+        StreamArn: {'Fn::ImportValue': !Sub '${DataStackName}-CtrStreamArn'}
+
+  AgentEventsStorage:
+    Type: AWS::Connect::InstanceStorageConfig
+    Condition: WireKinesisOn
+    Properties:
+      InstanceArn: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      ResourceType: AGENT_EVENTS
+      StorageType: KINESIS_STREAM
+      KinesisStreamConfig:
+        StreamArn: {'Fn::ImportValue': !Sub '${DataStackName}-AgentEventsStreamArn'}
+
+  # ------------------------------------------------------------------ alarms
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: AlarmsOn
+    Properties:
+      TopicName: !Sub '${Prefix}-alarms'
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: AlarmsAndEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  ApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-Web-API-5XX'
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions: [{Name: ApiName, Value: !Sub '${NamePrefixUpper}-Web-API'}, {Name: Stage, Value: !Ref ApiStageName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  CallerLookupErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-CallerLookup-Errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref CallerLookupFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  CallerLookupThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-CallerLookup-Throttles'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref CallerLookupFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # p99, not the average. If 99 invocations take 200 ms and one takes 9 seconds the average
+  # looks healthy and one caller heard silence then hit the Error branch. Connect's ceiling
+  # is 8 seconds, so alarm around 5 to give yourself warning.
+  CallerLookupDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-CallerLookup-DurationP99'
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref CallerLookupFunction}]
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  HolidayCheckErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-HolidayCheck-Errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref HolidayCheckFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  HolidayCheckThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-HolidayCheck-Throttles'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref HolidayCheckFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # p99, not the average. If 99 invocations take 200 ms and one takes 9 seconds the average
+  # looks healthy and one caller heard silence then hit the Error branch. Connect's ceiling
+  # is 8 seconds, so alarm around 5 to give yourself warning.
+  HolidayCheckDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-HolidayCheck-DurationP99'
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref HolidayCheckFunction}]
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  StartChatErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-StartChat-Errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref StartChatFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  StartChatThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-StartChat-Throttles'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref StartChatFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # p99, not the average. If 99 invocations take 200 ms and one takes 9 seconds the average
+  # looks healthy and one caller heard silence then hit the Error branch. Connect's ceiling
+  # is 8 seconds, so alarm around 5 to give yourself warning.
+  StartChatDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-StartChat-DurationP99'
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref StartChatFunction}]
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  RecordingRouterErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-RecordingRouter-Errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref RecordingRouterFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  RecordingRouterThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-RecordingRouter-Throttles'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref RecordingRouterFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # p99, not the average. If 99 invocations take 200 ms and one takes 9 seconds the average
+  # looks healthy and one caller heard silence then hit the Error branch. Connect's ceiling
+  # is 8 seconds, so alarm around 5 to give yourself warning.
+  RecordingRouterDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-RecordingRouter-DurationP99'
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref RecordingRouterFunction}]
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  SendSmsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-SendSms-Errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref SendSmsFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  SendSmsThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-SendSms-Throttles'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref SendSmsFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # p99, not the average. If 99 invocations take 200 ms and one takes 9 seconds the average
+  # looks healthy and one caller heard silence then hit the Error branch. Connect's ceiling
+  # is 8 seconds, so alarm around 5 to give yourself warning.
+  SendSmsDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsOn
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-SendSms-DurationP99'
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref SendSmsFunction}]
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ConnectContactFlowErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsAndConnect
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-Connect-ContactFlowErrors'
+      Namespace: AWS/Connect
+      MetricName: ContactFlowErrors
+      Dimensions: [{Name: InstanceId, Value: !Ref ConnectInstanceId}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ConnectContactFlowFatalErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsAndConnect
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-Connect-ContactFlowFatalErrors'
+      Namespace: AWS/Connect
+      MetricName: ContactFlowFatalErrors
+      Dimensions: [{Name: InstanceId, Value: !Ref ConnectInstanceId}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ConnectMissedCallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsAndConnect
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-Connect-MissedCalls'
+      Namespace: AWS/Connect
+      MetricName: MissedCalls
+      Dimensions: [{Name: InstanceId, Value: !Ref ConnectInstanceId}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ConnectCallRecordingUploadErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsAndConnect
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-Connect-CallRecordingUploadError'
+      Namespace: AWS/Connect
+      MetricName: CallRecordingUploadError
+      Dimensions: [{Name: InstanceId, Value: !Ref ConnectInstanceId}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ConnectConcurrentCallsPercentageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsAndConnect
+    Properties:
+      AlarmName: !Sub '${NamePrefixUpper}-Connect-ConcurrentCallsPercentage'
+      Namespace: AWS/Connect
+      MetricName: ConcurrentCallsPercentage
+      Dimensions: [{Name: InstanceId, Value: !Ref ConnectInstanceId}, {Name: MetricGroup, Value: VoiceCalls}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  ChatUrl:
+    Description: 'POST {"name":"Test"} here. Public and unauthenticated by design.'
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/chat'
+  CallerLookupArn:
+    Value: !GetAtt CallerLookupFunction.Arn
+  RecordingRouterArn:
+    Value: !GetAtt RecordingRouterFunction.Arn

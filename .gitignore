@@ -1,0 +1,26 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+terraform.tfvars
+*.auto.tfvars
+terraform/backend.tf
+# Do commit .terraform.lock.hcl once terraform init has created it
+
+# Build output
+.build/
+**/__pycache__/
+*.pyc
+*.zip
+.DS_Store
+
+# Never commit these
+.env
+*.pem
+*.key
+credentials
