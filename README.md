@@ -10,8 +10,9 @@ Meridian Bank is fictional. No real customer, account or bank data is in this re
 
 | Path | What it is |
 |---|---|
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | **Start here.** Step-by-step for GitHub, Terraform and CloudFormation, with destroy and troubleshooting. |
-| [`docs/REPO-PUSH.md`](docs/REPO-PUSH.md) | Publishing the repo to GitHub in detail. |
+| [`docs/RUNBOOK-POWERSHELL.md`](docs/RUNBOOK-POWERSHELL.md) | **Start here on Windows.** Step-by-step in PowerShell for GitHub, Terraform and CloudFormation, with destroy and troubleshooting. |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | The same runbook for AWS CloudShell (bash). |
+| [`docs/REPO-PUSH-POWERSHELL.md`](docs/REPO-PUSH-POWERSHELL.md), [`docs/REPO-PUSH.md`](docs/REPO-PUSH.md) | Publishing the repo to GitHub (PowerShell, bash). |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The design in plain English, with the proper technical terms beside each idea. Mermaid diagrams. |
 | [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) | All 19 lab modules, each as goal, architecture, commands, Terraform, cleanup. |
 | [`docs/CLEANUP.md`](docs/CLEANUP.md) | What costs money, in order, and how to switch it off. |
@@ -77,6 +78,7 @@ Amazon Connect itself (instance, flows, queues, Lex, Contact Lens, Q) is built i
 ## CloudFormation instead
 
 ```bash
+# bash / CloudShell. On Windows PowerShell use deploy.ps1, destroy.ps1 and seed-dynamodb.ps1 instead.
 cd cloudformation
 ./deploy.sh data
 ./deploy.sh network
