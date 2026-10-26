@@ -8,7 +8,9 @@
 #   ./stop-the-meter.sh scan                  read-only: list what is billing
 #   ./stop-the-meter.sh delete <stage>        DRY RUN: print what would go
 #   ./stop-the-meter.sh delete <stage> --yes  really delete it
+#   ./stop-the-meter.sh delete hourly --yes   ONLY the things that bill by the hour (the panic button)
 #   ./stop-the-meter.sh delete all  --yes     every stage, in the safe order
+#   ./stop-the-meter.sh usage "Amazon API Gateway"   month-to-date cost of one service, by usage type
 #
 # Safety rules built into this script:
 #   * Dry run is the default. Nothing is deleted without --yes.
@@ -493,6 +495,25 @@ stage_kms() {
 }
 
 ALL_STAGES="eks lb nat eip endpoints waf apigw lambda ecr streams analytics flowlogs logs alarms s3 dynamodb cfn vpc sms numbers instance kms"
+# The panic button: only what bills by the hour or per ACL. Everything here is rebuildable from the repo.
+HOURLY_STAGES="eks lb nat eip endpoints waf apigw streams"
+
+# Month-to-date cost of one service, split by usage type (finds the line item that is actually billing).
+usage() {
+  local svc="${1:-}" start end
+  [ -z "$svc" ] && { say "Usage: ./stop-the-meter.sh usage \"Amazon API Gateway\"   (names as shown by: ./stop-the-meter.sh costs)"; return 1; }
+  start="$(date -u +%Y-%m-01)"; end="$(date -u -d tomorrow +%Y-%m-%d)"
+  hdr "$svc  month to date ($start to $end), by usage type"
+  aws --region us-east-1 ce get-cost-and-usage --time-period "Start=$start,End=$end" --granularity MONTHLY \
+    --metrics UnblendedCost UsageQuantity \
+    --filter "{\"Dimensions\":{\"Key\":\"SERVICE\",\"Values\":[\"$svc\"]}}" \
+    --group-by Type=DIMENSION,Key=USAGE_TYPE --output json \
+  | jq -r '.ResultsByTime[].Groups[]
+           | select((.Metrics.UnblendedCost.Amount|tonumber) > 0.005)
+           | [(.Metrics.UnblendedCost.Amount|tonumber|.*100|round/100), .Keys[0], (.Metrics.UsageQuantity.Amount|tonumber|round)] | @tsv' \
+  | sort -k1,1nr
+  say "  columns: USD, usage type, quantity"
+}
 
 # ----------------------------------------------------------------------------
 # MAIN
@@ -515,10 +536,12 @@ done
 case "$cmd" in
   scan)  scan ;;
   costs) costs ;;
+  usage) usage "${stages# }" ;;
   delete)
-    [ -z "${stages// /}" ] && { say "Give a stage name or 'all'. Stages: $ALL_STAGES"; exit 1; }
+    [ -z "${stages// /}" ] && { say "Give a stage name, 'hourly' or 'all'. Stages: $ALL_STAGES"; exit 1; }
     [ "$APPLY" = 1 ] && say "*** LIVE MODE: resources will be deleted in $REGION ***" || say "*** DRY RUN: nothing will be deleted. Add --yes to apply. ***"
     [ "${stages// /}" = "all" ] && stages="$ALL_STAGES"
+    [ "${stages// /}" = "hourly" ] && stages="$HOURLY_STAGES"
     for s in $stages; do
       if declare -F "stage_$s" >/dev/null; then "stage_$s"; else say "Unknown stage: $s"; fi
     done
